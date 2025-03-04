@@ -35,6 +35,13 @@
             background: #f8f9fa;
             border-radius: 4px;
         }
+        #visualizer {
+            width: 100%;
+            height: 100px;
+            background: #f8f9fa;
+            margin-top: 1rem;
+            border-radius: 4px;
+        }
         #transcription {
             margin-top: 1rem;
             padding: 1rem;
@@ -67,130 +74,206 @@
     </style>
 </head>
 <body>
+    <h1>Real-time Audio Transcription</h1>
+    <div id="connectionStatus" class="connection-status disconnected">WebSocket: Disconnected</div>
+    <div class="controls">
+        <button id="startButton">Start Recording</button>
+        <button id="stopButton" disabled>Stop Recording</button>
+    </div>
+    <canvas id="visualizer"></canvas>
+    <div id="status" class="status">Ready to record</div>
+    <div id="transcription"></div>
 
-<h1>Real-time Audio Transcription</h1>
-<div id="connectionStatus" class="connection-status disconnected">WebSocket: Disconnected</div>
-<div class="controls">
-    <button id="startButton">Start Recording</button>
-    <button id="stopButton" disabled>Stop Recording</button>
-</div>
-<div id="status" class="status">Ready to record</div>
-<div id="transcription"></div>
-
-<script>
-    class AudioRecorder {
-        constructor() {
-            this.isRecording = false;
-            this.audioContext = new AudioContext({ sampleRate: 16000 });
-            this.socket = null;
-            this.processor = null;
-            this.source = null;
-            this.setupWebSocket();
-        }
-
-        setupWebSocket() {
-            this.socket = new WebSocket("ws://localhost:3001");
-
-            this.socket.onopen = () => {
-                this.updateConnectionStatus(true);
-                console.log("WebSocket connected.");
-            };
-
-            this.socket.onclose = () => {
-                this.updateConnectionStatus(false);
-                console.log("WebSocket disconnected. Reconnecting in 2 seconds...");
-                setTimeout(() => this.setupWebSocket(), 2000);
-            };
-
-            this.socket.onerror = (error) => {
-                console.error("WebSocket error:", error);
-                this.updateStatus("WebSocket error occurred");
-            };
-
-            this.socket.onmessage = (event) => {
-                this.displayTranscription(event.data);
-            };
-        }
-
-        async start() {
-            if (this.socket.readyState !== WebSocket.OPEN) {
-                this.updateStatus("WebSocket not connected. Please wait...");
-                return;
+    <script>
+        class AudioRecorder {
+            constructor() {
+                this.isRecording = false;
+                this.chunksProcessed = 0;
+                this.mediaRecorder = null;
+                
+                // Initialize WebSocket
+                this.setupWebSocket();
+                
+                // Initialize audio context for visualization
+                this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000
+                });
+                this.analyser = this.audioContext.createAnalyser();
+                
+                // Visualization setup
+                this.visualizer = document.getElementById('visualizer');
+                this.visualizerCtx = this.visualizer.getContext('2d');
+                this.resizeCanvas();
+                window.addEventListener('resize', () => this.resizeCanvas());
+                
+                // Transcription display
+                this.transcriptionDiv = document.getElementById('transcription');
             }
 
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                this.source = this.audioContext.createMediaStreamSource(stream);
-                this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
-
-                this.processor.onaudioprocess = (event) => {
-                    if (!this.isRecording) return;
-
-                    let inputBuffer = event.inputBuffer.getChannelData(0);
-                    let pcmBuffer = new Int16Array(inputBuffer.length);
-                    for (let i = 0; i < inputBuffer.length; i++) {
-                        pcmBuffer[i] = Math.min(1, Math.max(-1, inputBuffer[i])) * 32767;
-                    }
-
-                    if (this.socket.readyState === WebSocket.OPEN) {
-                        this.socket.send(pcmBuffer.buffer);
-                        console.log("Sent chunk:", pcmBuffer.length, "samples");
-                    } else {
-                        console.warn("WebSocket not open, can't send data.");
-                    }
+            setupWebSocket() {
+                this.ws = new WebSocket('ws://localhost:3001');
+                
+                this.ws.onopen = () => {
+                    this.updateConnectionStatus(true);
                 };
 
-                this.source.connect(this.processor);
-                this.processor.connect(this.audioContext.destination);
-                this.isRecording = true;
-                document.getElementById("startButton").disabled = true;
-                document.getElementById("stopButton").disabled = false;
-                this.updateStatus("Recording...");
-                console.log("Recording started.");
-            } catch (error) {
-                console.error("Error starting recording:", error);
-                this.updateStatus("Error: " + error.message);
+                this.ws.onclose = () => {
+                    this.updateConnectionStatus(false);
+                    // Attempt to reconnect after 2 seconds
+                    setTimeout(() => this.setupWebSocket(), 2000);
+                };
+
+                this.ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    this.updateStatus('WebSocket error occurred');
+                };
+
+                this.ws.onmessage = (event) => {
+                    this.displayTranscription(event.data);
+                };
+            }
+
+            updateConnectionStatus(connected) {
+                const statusDiv = document.getElementById('connectionStatus');
+                if (connected) {
+                    statusDiv.textContent = 'WebSocket: Connected';
+                    statusDiv.classList.remove('disconnected');
+                    statusDiv.classList.add('connected');
+                } else {
+                    statusDiv.textContent = 'WebSocket: Disconnected';
+                    statusDiv.classList.remove('connected');
+                    statusDiv.classList.add('disconnected');
+                }
+            }
+
+            displayTranscription(text) {
+                const entry = document.createElement('div');
+                entry.className = 'transcription-entry';
+                entry.textContent = text;
+                this.transcriptionDiv.appendChild(entry);
+                this.transcriptionDiv.scrollTop = this.transcriptionDiv.scrollHeight;
+            }
+
+            resizeCanvas() {
+                this.visualizer.width = this.visualizer.offsetWidth;
+                this.visualizer.height = this.visualizer.offsetHeight;
+            }
+
+            async start() {
+                if (this.ws.readyState !== WebSocket.OPEN) {
+                    this.updateStatus('WebSocket not connected. Please wait...');
+                    return;
+                }
+
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ 
+                        audio: {
+                            sampleRate: 16000,
+                            channelCount: 1,
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true
+                        } 
+                    });
+
+                    // Set up MediaRecorder
+                    this.mediaRecorder = new MediaRecorder(stream, {
+                        mimeType: 'audio/webm;codecs=opus',
+                        audioBitsPerSecond: 16000
+                    });
+
+                    // Set up audio visualization
+                    const source = this.audioContext.createMediaStreamSource(stream);
+                    source.connect(this.analyser);
+                    this.visualize();
+
+                    // Handle data chunks
+                    this.mediaRecorder.ondataavailable = async (event) => {
+                        if (event.data.size > 0 && this.ws.readyState === WebSocket.OPEN) {
+                            this.chunksProcessed++;
+                            this.ws.send(event.data);
+                            this.updateStatus(`Sent chunk ${this.chunksProcessed}`);
+                        }
+                    };
+
+                    // Start recording with 1 second intervals
+                    this.mediaRecorder.start(1000);
+                    this.isRecording = true;
+                    this.updateStatus('Recording...');
+                    
+                } catch (error) {
+                    console.error('Error starting recording:', error);
+                    this.updateStatus('Error: ' + error.message);
+                }
+            }
+
+            stop() {
+                if (this.mediaRecorder && this.isRecording) {
+                    this.mediaRecorder.stop();
+                    this.mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                    this.isRecording = false;
+                    this.updateStatus('Recording stopped');
+                }
+            }
+
+            visualize() {
+                if (!this.isRecording) return;
+
+                const bufferLength = this.analyser.frequencyBinCount;
+                const dataArray = new Uint8Array(bufferLength);
+                this.analyser.getByteTimeDomainData(dataArray);
+
+                this.visualizerCtx.fillStyle = '#f8f9fa';
+                this.visualizerCtx.fillRect(0, 0, this.visualizer.width, this.visualizer.height);
+
+                this.visualizerCtx.lineWidth = 2;
+                this.visualizerCtx.strokeStyle = '#007bff';
+                this.visualizerCtx.beginPath();
+
+                const sliceWidth = this.visualizer.width / bufferLength;
+                let x = 0;
+
+                for (let i = 0; i < bufferLength; i++) {
+                    const v = dataArray[i] / 128.0;
+                    const y = v * this.visualizer.height / 2;
+
+                    if (i === 0) {
+                        this.visualizerCtx.moveTo(x, y);
+                    } else {
+                        this.visualizerCtx.lineTo(x, y);
+                    }
+
+                    x += sliceWidth;
+                }
+
+                this.visualizerCtx.lineTo(this.visualizer.width, this.visualizer.height / 2);
+                this.visualizerCtx.stroke();
+
+                requestAnimationFrame(() => this.visualize());
+            }
+
+            updateStatus(message) {
+                const status = document.getElementById('status');
+                status.textContent = message;
             }
         }
 
-        stop() {
-            if (this.isRecording) {
-                this.processor.disconnect();
-                this.source.disconnect();
-                this.isRecording = false;
-                document.getElementById("startButton").disabled = false;
-                document.getElementById("stopButton").disabled = true;
-                this.updateStatus("Recording stopped");
-                console.log("Recording stopped.");
-            }
-        }
+        // Set up event listeners
+        const recorder = new AudioRecorder();
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
 
-        updateConnectionStatus(connected) {
-            const statusDiv = document.getElementById("connectionStatus");
-            statusDiv.textContent = connected ? "WebSocket: Connected" : "WebSocket: Disconnected";
-            statusDiv.classList.toggle("connected", connected);
-            statusDiv.classList.toggle("disconnected", !connected);
-        }
+        startButton.addEventListener('click', () => {
+            startButton.disabled = true;
+            stopButton.disabled = false;
+            recorder.start();
+        });
 
-        displayTranscription(text) {
-            const entry = document.createElement("div");
-            entry.className = "transcription-entry";
-            entry.textContent = text;
-            document.getElementById("transcription").appendChild(entry);
-        }
-
-        updateStatus(message) {
-            document.getElementById("status").textContent = message;
-        }
-    }
-
-    // Initialize recorder (Ensures no duplicate declarations)
-    let recorder = new AudioRecorder();
-
-    // Event Listeners
-    document.getElementById("startButton").addEventListener("click", () => recorder.start());
-    document.getElementById("stopButton").addEventListener("click", () => recorder.stop());
-</script>
-
+        stopButton.addEventListener('click', () => {
+            startButton.disabled = false;
+            stopButton.disabled = true;
+            recorder.stop();
+        });
+    </script>
 </body>
 </html>
